@@ -1,5 +1,6 @@
 import asyncio
 import re
+import aiohttp
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F, types
@@ -18,7 +19,7 @@ dp = Dispatcher()
 
 # === БАЗА ДАННЫХ ===
 db = {}
-global_usernames = {}  # Глобальный кэш: username (без @) -> user_id
+global_usernames = {}
 
 def get_chat_db(chat_id: int):
     if chat_id not in db:
@@ -26,8 +27,8 @@ def get_chat_db(chat_id: int):
             "welcome_msg": "Привет, {name} Добро пожаловать в чат VK M! Здесь можно пообсуждать баги, фичи и просто поболтать.",
             "rules": None,
             "warnings": {},
-            "mafia_status": "idle", # "idle" или "recruiting"
-            "mafia_players": set()  # Будем хранить ID игроков
+            "mafia_status": "idle",
+            "mafia_players": set()
         }
     return db[chat_id]
 
@@ -97,8 +98,46 @@ async def night_mute(bot: Bot):
         except Exception:
             pass
 
+# === ОБЩИЕ КОМАНДЫ (ДЛЯ ВСЕХ) ===
 
-# === НОВЫЕ ФУНКЦИИ (УДАЛЕНИЕ СООБЩЕНИЙ, РУЧНЫЙ МАТ, МАФИЯ) ===
+@dp.message(Command("pravila"), IsGroup())
+async def show_rules(message: types.Message):
+    chat_db = get_chat_db(message.chat.id)
+    if chat_db["rules"]:
+        await message.reply(f"📜 Правила группы:\n\n{chat_db['rules']}")
+    else:
+        await message.reply("В этой группе пока не установлены правила.")
+
+@dp.message(Command("getrelease"))
+async def get_latest_release(message: types.Message):
+    url = "https://api.github.com/repos/MaKrotos/Music-M/releases/latest"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    name = data.get("name", "Без названия")
+                    version = data.get("tag_name", "Неизвестно")
+                    body = data.get("body", "Нет описания")
+                    html_url = data.get("html_url", "https://github.com/MaKrotos/Music-M/releases")
+                    
+                    # Ограничиваем длину описания, если оно очень длинное
+                    if len(body) > 500:
+                        body = body[:500] + "...\n(читайте продолжение по ссылке)"
+                        
+                    text = (
+                        f"⚡️ последний релиз: {name}\n"
+                        f"📦 Версия: {version}\n"
+                        f"📝 Описание: {body}\n"
+                        f"🔗 <a href='{html_url}'>Ссылка на релиз</a>"
+                    )
+                    await message.reply(text, parse_mode="HTML", disable_web_page_preview=True)
+                else:
+                    await message.reply("❌ Не удалось получить релиз. Возможно, репозиторий приватный или релизов еще нет.")
+    except Exception as e:
+        await message.reply(f"❌ Ошибка при запросе к GitHub: {e}")
+
+# === УДАЛЕНИЕ СООБЩЕНИЙ И РУЧНОЙ МАТ ===
 
 @dp.message(Command("del"), IsGroup(), IsBotAdmin())
 async def delete_msg(message: types.Message):
@@ -106,9 +145,17 @@ async def delete_msg(message: types.Message):
         return await message.reply("Эту команду нужно использовать ответом на сообщение, которое нужно удалить.")
     try:
         await bot.delete_message(chat_id=message.chat.id, message_id=message.reply_to_message.message_id)
-        await message.delete() # Удаляем саму команду /del, чтобы не мусорить
+        await message.delete() 
     except Exception as e:
-        await message.reply(f"❌ Ошибка удаления (возможно, боту не хватает прав): {e}")
+        error_text = (
+            f"❌ Ошибка удаления.\n"
+            f"Возможные причины:\n"
+            f"1. Бот не администратор или у него нет прав удалять сообщения.\n"
+            f"2. Сообщение старше 48 часов.\n"
+            f"3. Вы пытаетесь удалить сообщение создателя группы.\n\n"
+            f"Техническая ошибка: {e}"
+        )
+        await message.reply(error_text)
 
 @dp.message(Command("mat"), IsGroup(), IsBotAdmin())
 async def manual_warn(message: types.Message):
@@ -116,12 +163,10 @@ async def manual_warn(message: types.Message):
     target_user_id = None
     target_username = ""
 
-    # Проверяем, если команда вызвана ответом на сообщение
     if message.reply_to_message:
         target_user_id = message.reply_to_message.from_user.id
         target_username = f"@{message.reply_to_message.from_user.username}" if message.reply_to_message.from_user.username else message.reply_to_message.from_user.first_name
     else:
-        # Если вызвана форматом /mat @юзернейм
         parts = message.text.split()
         if len(parts) > 1 and parts[1].startswith("@"):
             target_user_id = resolve_user_id(parts[1])
@@ -145,6 +190,8 @@ async def manual_warn(message: types.Message):
     else:
         await message.reply(f"Администратор выдал предупреждение участнику {target_username}! Предупреждение {warn_count}/3.")
 
+# === ИГРА "МАФИЯ" ===
+
 @dp.message(Command("startgame"), IsGroup(), IsBotAdmin())
 async def start_game(message: types.Message):
     chat_db = get_chat_db(message.chat.id)
@@ -155,7 +202,6 @@ async def start_game(message: types.Message):
     chat_db["mafia_players"] = set()
     
     bot_info = await bot.get_me()
-    # Заменяем минус на m, так как Telegram может не пропускать минус в deep link payload
     safe_chat_id = str(message.chat.id).replace("-", "m")
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -175,11 +221,9 @@ async def stop_game(message: types.Message):
 async def private_start(message: types.Message):
     parts = message.text.split(maxsplit=1)
     
-    # Обычный старт бота
     if len(parts) == 1:
         return await message.answer("Привет! Я бот для управления группой.")
         
-    # Обработка Deep Linking (переход с кнопки "Играть")
     if len(parts) > 1 and parts[1].startswith("mafia_"):
         safe_chat_id = parts[1].replace("mafia_", "")
         chat_id_str = safe_chat_id.replace("m", "-")
@@ -201,7 +245,6 @@ async def private_start(message: types.Message):
         if message.from_user.id in players:
             return await message.answer("Ты уже участвуешь в игре!")
             
-        # Добавляем игрока
         players.add(message.from_user.id)
         chat_db["mafia_players"] = players
         
@@ -210,11 +253,9 @@ async def private_start(message: types.Message):
         user_display = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
         await bot.send_message(chat_id, f"Участник {user_display} присоединился к Мафии! ({len(players)}/5)")
         
-        # Если набралось ровно 5 игроков, закрываем набор
         if len(players) == 5:
             chat_db["mafia_status"] = "idle"
             await bot.send_message(chat_id, "🎉 **Набрано 5 игроков! Набор автоматически закрыт.**")
-
 
 # === ОТПРАВКА СООБЩЕНИЙ В ЛС ===
 
@@ -237,7 +278,6 @@ async def send_msg_on_behalf(message: types.Message):
     except Exception as e:
         await message.reply(f"❌ Ошибка отправки: {e}")
 
-
 # === ВХОД И ВЫХОД УЧАСТНИКОВ ===
 
 @dp.message(IsGroup(), F.new_chat_members)
@@ -255,7 +295,6 @@ async def goodbye_member(message: types.Message):
     left_user = message.left_chat_member
     user_name = left_user.first_name if left_user.first_name else left_user.username
     await message.answer(f"Пока, {user_name}, ты, это, если что возвращайся, мы будем тебе рады.")
-
 
 # === КОМАНДЫ НАСТРОЙКИ ===
 
@@ -282,7 +321,6 @@ async def del_rules(message: types.Message):
     chat_db = get_chat_db(message.chat.id)
     chat_db["rules"] = None
     await message.reply("🗑 Правила удалены.")
-
 
 # === КОМАНДЫ МОДЕРАЦИИ ===
 
@@ -333,12 +371,11 @@ async def mute_user(message: types.Message):
     await bot.restrict_chat_member(message.chat.id, user_id, ChatPermissions(can_send_messages=False), until_date=until_date)
     await message.answer(f"🤐 Участник {target_username} заглушен на {time_str}.\nПричина: {reason}")
 
-
 # === АВТОМОДЕРАЦИЯ (МАТ) ===
 
 @dp.message(IsGroup())
 async def auto_moderator(message: types.Message):
-    if not message.text:
+    if not message.text or message.text.startswith('/'):
         return
 
     text_lower = message.text.lower()
@@ -365,7 +402,6 @@ async def auto_moderator(message: types.Message):
             break
 
 async def main():
-    # Планировщик задач (время по Москве)
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
     scheduler.add_job(morning_routine, trigger='cron', hour=7, minute=0, kwargs={'bot': bot})
     scheduler.add_job(evening_warning, trigger='cron', hour=21, minute=45, kwargs={'bot': bot})
