@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, BaseFilter
-from aiogram.types import ChatPermissions
+from aiogram.types import ChatPermissions, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram import BaseMiddleware
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -25,7 +25,9 @@ def get_chat_db(chat_id: int):
         db[chat_id] = {
             "welcome_msg": "Привет, {name} Добро пожаловать в чат VK M! Здесь можно пообсуждать баги, фичи и просто поболтать.",
             "rules": None,
-            "warnings": {}
+            "warnings": {},
+            "mafia_status": "idle", # "idle" или "recruiting"
+            "mafia_players": set()  # Будем хранить ID игроков
         }
     return db[chat_id]
 
@@ -56,7 +58,6 @@ class UsernameCacheMiddleware(BaseMiddleware):
         if event.from_user and event.from_user.username:
             global_usernames[event.from_user.username.lower()] = event.from_user.id
             
-        # Если сообщение в группе, инициализируем базу чата, чтобы шедулер знал этот ID
         if event.chat and event.chat.type in ["group", "supergroup"]:
             get_chat_db(event.chat.id)
             
@@ -66,46 +67,154 @@ dp.message.middleware(UsernameCacheMiddleware())
 
 # === РАСПИСАНИЕ И АВТОМАТИЧЕСКИЙ МУТ ЧАТА ===
 
-# Стандартные права для разблокировки чата
 DEFAULT_PERMISSIONS = ChatPermissions(
-    can_send_messages=True,
-    can_send_audios=True,
-    can_send_documents=True,
-    can_send_photos=True,
-    can_send_videos=True,
-    can_send_video_notes=True,
-    can_send_voice_notes=True,
-    can_send_polls=True,
-    can_send_other_messages=True,
-    can_add_web_page_previews=True,
-    can_invite_users=True
+    can_send_messages=True, can_send_audios=True, can_send_documents=True,
+    can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
+    can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
+    can_add_web_page_previews=True, can_invite_users=True
 )
 
 async def morning_routine(bot: Bot):
-    """Срабатывает в 07:00 по МСК"""
     for chat_id in list(db.keys()):
         try:
             await bot.set_chat_permissions(chat_id, DEFAULT_PERMISSIONS)
             await bot.send_message(chat_id, "Сейчас - 7:00 по московскому времени! Пора вставать, всем доброе утро!")
-        except Exception as e:
-            print(f"Ошибка утренней рутины для {chat_id}: {e}")
+        except Exception:
+            pass
 
 async def evening_warning(bot: Bot):
-    """Срабатывает в 21:45 по МСК"""
     for chat_id in list(db.keys()):
         try:
             await bot.send_message(chat_id, "Сейчас по московскому времени 21:45, а значит пора ложится спать. Всем спокойной ночи, через 15 минут возможность писать сообщения в чат останется только у админов, чат будет замучен до 7:00 по московскому времени. Добрых снов!")
-        except Exception as e:
-            print(f"Ошибка вечернего предупреждения для {chat_id}: {e}")
+        except Exception:
+            pass
 
 async def night_mute(bot: Bot):
-    """Срабатывает в 22:00 по МСК"""
     for chat_id in list(db.keys()):
         try:
             await bot.set_chat_permissions(chat_id, ChatPermissions(can_send_messages=False))
             await bot.send_message(chat_id, "🔒 Чат переведен в ночной режим (писать могут только администраторы).")
-        except Exception as e:
-            print(f"Ошибка ночного мута для {chat_id}: {e}")
+        except Exception:
+            pass
+
+
+# === НОВЫЕ ФУНКЦИИ (УДАЛЕНИЕ СООБЩЕНИЙ, РУЧНЫЙ МАТ, МАФИЯ) ===
+
+@dp.message(Command("del"), IsGroup(), IsBotAdmin())
+async def delete_msg(message: types.Message):
+    if not message.reply_to_message:
+        return await message.reply("Эту команду нужно использовать ответом на сообщение, которое нужно удалить.")
+    try:
+        await bot.delete_message(chat_id=message.chat.id, message_id=message.reply_to_message.message_id)
+        await message.delete() # Удаляем саму команду /del, чтобы не мусорить
+    except Exception as e:
+        await message.reply(f"❌ Ошибка удаления (возможно, боту не хватает прав): {e}")
+
+@dp.message(Command("mat"), IsGroup(), IsBotAdmin())
+async def manual_warn(message: types.Message):
+    chat_db = get_chat_db(message.chat.id)
+    target_user_id = None
+    target_username = ""
+
+    # Проверяем, если команда вызвана ответом на сообщение
+    if message.reply_to_message:
+        target_user_id = message.reply_to_message.from_user.id
+        target_username = f"@{message.reply_to_message.from_user.username}" if message.reply_to_message.from_user.username else message.reply_to_message.from_user.first_name
+    else:
+        # Если вызвана форматом /mat @юзернейм
+        parts = message.text.split()
+        if len(parts) > 1 and parts[1].startswith("@"):
+            target_user_id = resolve_user_id(parts[1])
+            target_username = parts[1]
+            
+    if not target_user_id:
+        return await message.reply("Ответь этой командой на сообщение нарушителя или напиши /mat @юзернейм")
+        
+    now = datetime.now()
+    if target_user_id not in chat_db["warnings"]:
+        chat_db["warnings"][target_user_id] = []
+        
+    chat_db["warnings"][target_user_id] = [w for w in chat_db["warnings"][target_user_id] if now - w < timedelta(days=7)]
+    chat_db["warnings"][target_user_id].append(now)
+    warn_count = len(chat_db["warnings"][target_user_id])
+    
+    if warn_count >= 3:
+        await bot.ban_chat_member(chat_id=message.chat.id, user_id=target_user_id)
+        await message.reply(f"Участник {target_username} был удален из группы за 3 предупреждения (выдано админом).")
+        chat_db["warnings"][target_user_id] = []
+    else:
+        await message.reply(f"Администратор выдал предупреждение участнику {target_username}! Предупреждение {warn_count}/3.")
+
+@dp.message(Command("startgame"), IsGroup(), IsBotAdmin())
+async def start_game(message: types.Message):
+    chat_db = get_chat_db(message.chat.id)
+    if chat_db.get("mafia_status") == "recruiting":
+        return await message.reply("Набор уже открыт!")
+        
+    chat_db["mafia_status"] = "recruiting"
+    chat_db["mafia_players"] = set()
+    
+    bot_info = await bot.get_me()
+    # Заменяем минус на m, так как Telegram может не пропускать минус в deep link payload
+    safe_chat_id = str(message.chat.id).replace("-", "m")
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Играть 🕵️‍♂️", url=f"https://t.me/{bot_info.username}?start=mafia_{safe_chat_id}")]
+    ])
+    
+    await message.answer("🕵️‍♂️ **Объявляется набор в Мафию!**\n\nНужно 5 игроков. Нажми кнопку ниже, чтобы присоединиться.", reply_markup=keyboard)
+
+@dp.message(Command("stopgame"), IsGroup(), IsBotAdmin())
+async def stop_game(message: types.Message):
+    chat_db = get_chat_db(message.chat.id)
+    chat_db["mafia_status"] = "idle"
+    chat_db["mafia_players"] = set()
+    await message.answer("🛑 Набор в Мафию закрыт админом.")
+
+@dp.message(Command("start"), F.chat.type == "private")
+async def private_start(message: types.Message):
+    parts = message.text.split(maxsplit=1)
+    
+    # Обычный старт бота
+    if len(parts) == 1:
+        return await message.answer("Привет! Я бот для управления группой.")
+        
+    # Обработка Deep Linking (переход с кнопки "Играть")
+    if len(parts) > 1 and parts[1].startswith("mafia_"):
+        safe_chat_id = parts[1].replace("mafia_", "")
+        chat_id_str = safe_chat_id.replace("m", "-")
+        
+        try:
+            chat_id = int(chat_id_str)
+        except ValueError:
+            return await message.answer("❌ Ошибка: неверный код группы.")
+            
+        chat_db = get_chat_db(chat_id)
+        if chat_db.get("mafia_status") != "recruiting":
+            return await message.answer("❌ Набор в игру в этой группе сейчас закрыт.")
+            
+        players = chat_db.get("mafia_players", set())
+        
+        if len(players) >= 5:
+            return await message.answer("❌ Мест нет! Уже набрано 5 игроков.")
+            
+        if message.from_user.id in players:
+            return await message.answer("Ты уже участвуешь в игре!")
+            
+        # Добавляем игрока
+        players.add(message.from_user.id)
+        chat_db["mafia_players"] = players
+        
+        await message.answer("✅ Ты теперь участвуешь в Мафии! Возвращайся в группу и жди начала.")
+        
+        user_display = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
+        await bot.send_message(chat_id, f"Участник {user_display} присоединился к Мафии! ({len(players)}/5)")
+        
+        # Если набралось ровно 5 игроков, закрываем набор
+        if len(players) == 5:
+            chat_db["mafia_status"] = "idle"
+            await bot.send_message(chat_id, "🎉 **Набрано 5 игроков! Набор автоматически закрыт.**")
+
 
 # === ОТПРАВКА СООБЩЕНИЙ В ЛС ===
 
@@ -128,6 +237,7 @@ async def send_msg_on_behalf(message: types.Message):
     except Exception as e:
         await message.reply(f"❌ Ошибка отправки: {e}")
 
+
 # === ВХОД И ВЫХОД УЧАСТНИКОВ ===
 
 @dp.message(IsGroup(), F.new_chat_members)
@@ -146,7 +256,8 @@ async def goodbye_member(message: types.Message):
     user_name = left_user.first_name if left_user.first_name else left_user.username
     await message.answer(f"Пока, {user_name}, ты, это, если что возвращайся, мы будем тебе рады.")
 
-# === КОМАНДЫ НАСТРОЙКИ (ДЛЯ АДМИНОВ) ===
+
+# === КОМАНДЫ НАСТРОЙКИ ===
 
 @dp.message(Command("newprivet"), IsGroup(), IsBotAdmin())
 async def set_welcome_msg(message: types.Message):
@@ -172,11 +283,11 @@ async def del_rules(message: types.Message):
     chat_db["rules"] = None
     await message.reply("🗑 Правила удалены.")
 
-# === КОМАНДЫ МОДЕРАЦИИ (ДЛЯ АДМИНОВ) ===
+
+# === КОМАНДЫ МОДЕРАЦИИ ===
 
 @dp.message(Command("unmute"), IsGroup(), IsBotAdmin())
 async def unmute_chat(message: types.Message):
-    """Снимает мут со всей группы досрочно"""
     try:
         await bot.set_chat_permissions(message.chat.id, DEFAULT_PERMISSIONS)
         await message.reply("✅ Мут с чата снят! Все участники снова могут писать сообщения.")
@@ -222,6 +333,7 @@ async def mute_user(message: types.Message):
     await bot.restrict_chat_member(message.chat.id, user_id, ChatPermissions(can_send_messages=False), until_date=until_date)
     await message.answer(f"🤐 Участник {target_username} заглушен на {time_str}.\nПричина: {reason}")
 
+
 # === АВТОМОДЕРАЦИЯ (МАТ) ===
 
 @dp.message(IsGroup())
@@ -253,7 +365,7 @@ async def auto_moderator(message: types.Message):
             break
 
 async def main():
-    # Настройка планировщика задач с московским часовым поясом
+    # Планировщик задач (время по Москве)
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
     scheduler.add_job(morning_routine, trigger='cron', hour=7, minute=0, kwargs={'bot': bot})
     scheduler.add_job(evening_warning, trigger='cron', hour=21, minute=45, kwargs={'bot': bot})
